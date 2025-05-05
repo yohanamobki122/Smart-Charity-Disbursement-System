@@ -252,3 +252,35 @@
     (ok recoverable-amount)
   )
 )
+
+
+
+(define-constant err-no-changes (err u112))
+
+(define-public (update-charity-metadata 
+    (charity-id uint) 
+    (new-name (optional (string-ascii 100))) 
+    (new-description (optional (string-ascii 500))))
+  (let
+    (
+      (charity (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (final-name (default-to (get name charity) new-name))
+      (final-description (default-to (get description charity) new-description))
+    )
+    (asserts! (is-eq (get creator charity) tx-sender) err-unauthorized)
+    (asserts! (get is-active charity) err-charity-not-active)
+    (asserts! (or (is-some new-name) (is-some new-description)) err-no-changes)
+    
+    (map-set charities
+      { charity-id: charity-id }
+      (merge charity 
+        { 
+          name: final-name,
+          description: final-description
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
