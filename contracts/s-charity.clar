@@ -229,3 +229,26 @@
   )
 )
 
+(define-constant err-no-funds-to-recover (err u110))
+(define-constant err-charity-still-active (err u111))
+
+(define-public (recover-inactive-charity-funds (charity-id uint))
+  (let
+    (
+      (charity (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (recoverable-amount (- (get total-funds charity) (get funds-disbursed charity)))
+    )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) err-owner-only)
+    (asserts! (not (get is-active charity)) err-charity-still-active)
+    (asserts! (> recoverable-amount u0) err-no-funds-to-recover)
+    
+    (try! (as-contract (stx-transfer? recoverable-amount tx-sender (var-get contract-owner))))
+    
+    (map-set charities
+      { charity-id: charity-id }
+      (merge charity { funds-disbursed: (get total-funds charity) })
+    )
+    
+    (ok recoverable-amount)
+  )
+)
