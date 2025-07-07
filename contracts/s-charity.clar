@@ -147,6 +147,7 @@
     (
       (charity (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
       (current-donation (get-donor-contribution charity-id tx-sender))
+      (is-new-donor (is-eq current-donation u0))
     )
     (asserts! (get is-active charity) err-charity-not-active)
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
@@ -160,6 +161,8 @@
       { charity-id: charity-id }
       (merge charity { total-funds: (+ (get total-funds charity) amount) })
     )
+    
+    (unwrap-panic (update-charity-analytics charity-id is-new-donor amount))
     
     (ok true)
   )
@@ -208,6 +211,8 @@
       { charity-id: charity-id }
       (merge charity { funds-disbursed: (+ (get funds-disbursed charity) disburse-amount) })
     )
+    
+    (unwrap-panic (increment-milestone-completion charity-id))
     
     (ok true)
   )
@@ -385,4 +390,157 @@
       { charity-id: charity-id }
       (merge charity { total-funds: (+ (get total-funds charity) amount) }))
     
+    (unwrap-panic (update-charity-analytics charity-id (is-eq current-donation u0) amount))
+    
     (ok true)))
+
+(define-map charity-analytics
+  { charity-id: uint }
+  {
+    total-donors: uint,
+    avg-donation-amount: uint,
+    days-since-creation: uint,
+    milestones-completed: uint,
+    funding-efficiency-score: uint,
+    last-activity-block: uint
+  }
+)
+
+(define-read-only (get-charity-analytics (charity-id uint))
+  (map-get? charity-analytics { charity-id: charity-id })
+)
+
+(define-read-only (calculate-funding-velocity (charity-id uint))
+  (let
+    (
+      (charity (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (analytics (map-get? charity-analytics { charity-id: charity-id }))
+    )
+    (match analytics
+      some-analytics
+        (if (> (get days-since-creation some-analytics) u0)
+          (ok (/ (get total-funds charity) (get days-since-creation some-analytics)))
+          (ok u0))
+      (ok u0)
+    )
+  )
+)
+
+(define-read-only (get-milestone-completion-rate (charity-id uint))
+  (let
+    (
+      (charity (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (analytics (map-get? charity-analytics { charity-id: charity-id }))
+    )
+    (match analytics
+      some-analytics
+        (if (> (get milestone-count charity) u0)
+          (ok (/ (* (get milestones-completed some-analytics) u100) (get milestone-count charity)))
+          (ok u0))
+      (ok u0)
+    )
+  )
+)
+
+(define-read-only (get-donor-engagement-score (charity-id uint))
+  (let
+    (
+      (charity (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (analytics (map-get? charity-analytics { charity-id: charity-id }))
+    )
+    (match analytics
+      some-analytics
+        (if (> (get total-donors some-analytics) u0)
+          (ok (/ (get total-funds charity) (get total-donors some-analytics)))
+          (ok u0))
+      (ok u0)
+    )
+  )
+)
+
+(define-private (update-charity-analytics (charity-id uint) (is-new-donor bool) (donation-amount uint))
+  (let
+    (
+      (charity (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (current-analytics (default-to 
+        {
+          total-donors: u0,
+          avg-donation-amount: u0,
+          days-since-creation: u1,
+          milestones-completed: u0,
+          funding-efficiency-score: u0,
+          last-activity-block: stacks-block-height
+        }
+        (map-get? charity-analytics { charity-id: charity-id })))
+      (new-donor-count (if is-new-donor (+ (get total-donors current-analytics) u1) (get total-donors current-analytics)))
+      (new-avg-donation (if (> new-donor-count u0) 
+        (/ (get total-funds charity) new-donor-count) 
+        u0))
+      (efficiency-score (if (> (get total-funds charity) u0)
+        (/ (* (get funds-disbursed charity) u100) (get total-funds charity))
+        u0))
+    )
+    (map-set charity-analytics
+      { charity-id: charity-id }
+      {
+        total-donors: new-donor-count,
+        avg-donation-amount: new-avg-donation,
+        days-since-creation: (get days-since-creation current-analytics),
+        milestones-completed: (get milestones-completed current-analytics),
+        funding-efficiency-score: efficiency-score,
+        last-activity-block: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (increment-milestone-completion (charity-id uint))
+  (let
+    (
+      (current-analytics (default-to 
+        {
+          total-donors: u0,
+          avg-donation-amount: u0,
+          days-since-creation: u1,
+          milestones-completed: u0,
+          funding-efficiency-score: u0,
+          last-activity-block: stacks-block-height
+        }
+        (map-get? charity-analytics { charity-id: charity-id })))
+    )
+    (map-set charity-analytics
+      { charity-id: charity-id }
+      (merge current-analytics 
+        { 
+          milestones-completed: (+ (get milestones-completed current-analytics) u1),
+          last-activity-block: stacks-block-height
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (initialize-charity-analytics (charity-id uint))
+  (let
+    (
+      (charity (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+    )
+    (asserts! (is-eq (get creator charity) tx-sender) err-unauthorized)
+    (asserts! (is-none (map-get? charity-analytics { charity-id: charity-id })) err-already-exists)
+    
+    (map-set charity-analytics
+      { charity-id: charity-id }
+      {
+        total-donors: u0,
+        avg-donation-amount: u0,
+        days-since-creation: u1,
+        milestones-completed: u0,
+        funding-efficiency-score: u0,
+        last-activity-block: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
