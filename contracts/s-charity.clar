@@ -544,3 +544,283 @@
     (ok true)
   )
 )
+
+;; Impact Reporting System Constants
+(define-constant err-report-not-found (err u116))
+(define-constant err-invalid-report-type (err u117))
+(define-constant err-report-already-exists (err u118))
+(define-constant err-invalid-beneficiary-count (err u119))
+(define-constant err-report-not-verified (err u120))
+
+;; Impact report types: 1=Educational, 2=Healthcare, 3=Environmental, 4=Social, 5=Economic
+(define-map impact-reports
+  { charity-id: uint, report-id: uint }
+  {
+    report-type: uint,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    beneficiaries-reached: uint,
+    funds-utilized: uint,
+    measurable-outcome: (string-ascii 200),
+    outcome-value: uint,
+    reporting-period-start: uint,
+    reporting-period-end: uint,
+    submission-date: uint,
+    is-verified: bool,
+    verified-by: (optional principal)
+  }
+)
+
+;; Counter for impact reports per charity
+(define-map charity-report-counters
+  { charity-id: uint }
+  { next-report-id: uint }
+)
+
+;; Aggregated impact data per charity
+(define-map charity-impact-summary
+  { charity-id: uint }
+  {
+    total-reports: uint,
+    total-beneficiaries: uint,
+    total-funds-reported: uint,
+    verified-reports: uint,
+    last-report-date: uint,
+    impact-score: uint
+  }
+)
+
+;; Read-only functions for impact reporting
+(define-read-only (get-impact-report (charity-id uint) (report-id uint))
+  (map-get? impact-reports { charity-id: charity-id, report-id: report-id })
+)
+
+(define-read-only (get-charity-impact-summary (charity-id uint))
+  (map-get? charity-impact-summary { charity-id: charity-id })
+)
+
+(define-read-only (get-charity-report-count (charity-id uint))
+  (default-to u0 
+    (get next-report-id 
+      (map-get? charity-report-counters { charity-id: charity-id })))
+)
+
+(define-read-only (calculate-charity-impact-score (charity-id uint))
+  (let
+    (
+      (summary (map-get? charity-impact-summary { charity-id: charity-id }))
+    )
+    (match summary
+      some-summary
+        (let
+          (
+            (verified-percentage (if (> (get total-reports some-summary) u0)
+              (/ (* (get verified-reports some-summary) u100) (get total-reports some-summary))
+              u0))
+            (beneficiary-factor (if (> (get total-beneficiaries some-summary) u1000)
+              u100
+              (/ (get total-beneficiaries some-summary) u10)))
+            (reporting-frequency (if (> (get total-reports some-summary) u0)
+              (if (< (* (get total-reports some-summary) u10) u50)
+                (* (get total-reports some-summary) u10)
+                u50)
+              u0))
+          )
+          (ok (+ verified-percentage beneficiary-factor reporting-frequency))
+        )
+      (ok u0)
+    )
+  )
+)
+
+;; Submit new impact report
+(define-public (submit-impact-report 
+    (charity-id uint)
+    (report-type uint)
+    (title (string-ascii 100))
+    (description (string-ascii 500))
+    (beneficiaries-reached uint)
+    (funds-utilized uint)
+    (measurable-outcome (string-ascii 200))
+    (outcome-value uint)
+    (reporting-period-start uint)
+    (reporting-period-end uint))
+  (let
+    (
+      (charity (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (current-counter (default-to { next-report-id: u1 } 
+        (map-get? charity-report-counters { charity-id: charity-id })))
+      (report-id (get next-report-id current-counter))
+    )
+    ;; Validate inputs
+    (asserts! (is-eq (get creator charity) tx-sender) err-unauthorized)
+    (asserts! (and (>= report-type u1) (<= report-type u5)) err-invalid-report-type)
+    (asserts! (<= beneficiaries-reached u1000000) err-invalid-beneficiary-count)
+    (asserts! (<= reporting-period-start reporting-period-end) err-invalid-percentage)
+    (asserts! (is-none (map-get? impact-reports { charity-id: charity-id, report-id: report-id })) err-report-already-exists)
+    
+    ;; Create impact report
+    (map-set impact-reports
+      { charity-id: charity-id, report-id: report-id }
+      {
+        report-type: report-type,
+        title: title,
+        description: description,
+        beneficiaries-reached: beneficiaries-reached,
+        funds-utilized: funds-utilized,
+        measurable-outcome: measurable-outcome,
+        outcome-value: outcome-value,
+        reporting-period-start: reporting-period-start,
+        reporting-period-end: reporting-period-end,
+        submission-date: stacks-block-height,
+        is-verified: false,
+        verified-by: none
+      }
+    )
+    
+    ;; Update report counter
+    (map-set charity-report-counters
+      { charity-id: charity-id }
+      { next-report-id: (+ report-id u1) }
+    )
+    
+    ;; Update impact summary
+    (unwrap-panic (update-charity-impact-summary charity-id beneficiaries-reached funds-utilized false))
+    
+    (ok report-id)
+  )
+)
+
+;; Verify impact report (only by authorized verifiers)
+(define-public (verify-impact-report (charity-id uint) (report-id uint))
+  (let
+    (
+      (report (unwrap! (map-get? impact-reports { charity-id: charity-id, report-id: report-id }) err-report-not-found))
+    )
+    (asserts! (is-authorized-verifier tx-sender) err-verifier-not-authorized)
+    (asserts! (not (get is-verified report)) err-already-verified)
+    
+    ;; Mark report as verified
+    (map-set impact-reports
+      { charity-id: charity-id, report-id: report-id }
+      (merge report { is-verified: true, verified-by: (some tx-sender) })
+    )
+    
+    ;; Update impact summary for verification
+    (unwrap-panic (update-charity-impact-summary charity-id u0 u0 true))
+    
+    (ok true)
+  )
+)
+
+;; Revoke report verification
+(define-public (revoke-impact-report-verification (charity-id uint) (report-id uint))
+  (let
+    (
+      (report (unwrap! (map-get? impact-reports { charity-id: charity-id, report-id: report-id }) err-report-not-found))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (var-get contract-owner))
+      (is-eq (some tx-sender) (get verified-by report))) err-unauthorized)
+    (asserts! (get is-verified report) err-report-not-verified)
+    
+    ;; Remove verification
+    (map-set impact-reports
+      { charity-id: charity-id, report-id: report-id }
+      (merge report { is-verified: false, verified-by: none })
+    )
+    
+    ;; Update impact summary (decrease verified count)
+    (let
+      (
+        (current-summary (default-to
+          { total-reports: u0, total-beneficiaries: u0, total-funds-reported: u0, 
+            verified-reports: u0, last-report-date: u0, impact-score: u0 }
+          (map-get? charity-impact-summary { charity-id: charity-id })))
+      )
+      (map-set charity-impact-summary
+        { charity-id: charity-id }
+        (merge current-summary 
+          { verified-reports: (if (> (get verified-reports current-summary) u0)
+            (- (get verified-reports current-summary) u1)
+            u0) })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Update charity impact summary (private helper function)
+(define-private (update-charity-impact-summary 
+    (charity-id uint) 
+    (new-beneficiaries uint) 
+    (new-funds uint) 
+    (is-verification bool))
+  (let
+    (
+      (current-summary (default-to
+        { total-reports: u0, total-beneficiaries: u0, total-funds-reported: u0, 
+          verified-reports: u0, last-report-date: u0, impact-score: u0 }
+        (map-get? charity-impact-summary { charity-id: charity-id })))
+      (new-total-reports (if is-verification 
+        (get total-reports current-summary)
+        (+ (get total-reports current-summary) u1)))
+      (new-verified-reports (if is-verification
+        (+ (get verified-reports current-summary) u1)
+        (get verified-reports current-summary)))
+      (impact-score (if (> new-total-reports u0)
+        (+ (/ (* new-verified-reports u50) new-total-reports)
+           (if (< (/ (+ (get total-beneficiaries current-summary) new-beneficiaries) u100) u30)
+             (/ (+ (get total-beneficiaries current-summary) new-beneficiaries) u100)
+             u30)
+           (if (< (/ new-total-reports u2) u20)
+             (/ new-total-reports u2)
+             u20))
+        u0))
+    )
+    (map-set charity-impact-summary
+      { charity-id: charity-id }
+      {
+        total-reports: new-total-reports,
+        total-beneficiaries: (+ (get total-beneficiaries current-summary) new-beneficiaries),
+        total-funds-reported: (+ (get total-funds-reported current-summary) new-funds),
+        verified-reports: new-verified-reports,
+        last-report-date: stacks-block-height,
+        impact-score: impact-score
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Check if a specific report matches the given type
+(define-read-only (is-report-of-type (charity-id uint) (report-id uint) (target-type uint))
+  (let
+    (
+      (report (map-get? impact-reports { charity-id: charity-id, report-id: report-id }))
+    )
+    (match report
+      some-report (is-eq (get report-type some-report) target-type)
+      false
+    )
+  )
+)
+
+;; Get total beneficiaries across all verified reports for a charity
+(define-read-only (get-verified-beneficiaries-total (charity-id uint))
+  (let
+    (
+      (summary (map-get? charity-impact-summary { charity-id: charity-id }))
+    )
+    (match summary
+      some-summary 
+        (if (> (get verified-reports some-summary) u0)
+          (get total-beneficiaries some-summary)
+          u0)
+      u0
+    )
+  )
+)
+
+
