@@ -807,6 +807,365 @@
   )
 )
 
+;; ================================
+;; DONOR RECOGNITION & REWARDS SYSTEM
+;; ================================
+
+;; Additional error constants for donor recognition
+(define-constant err-invalid-tier (err u121))
+(define-constant err-badge-already-earned (err u122))
+(define-constant err-streak-not-active (err u123))
+(define-constant err-insufficient-donation-history (err u124))
+
+;; Donor loyalty tier thresholds (in microSTX)
+(define-constant tier-bronze-threshold u1000000)     ;; 1 STX
+(define-constant tier-silver-threshold u10000000)    ;; 10 STX
+(define-constant tier-gold-threshold u50000000)      ;; 50 STX
+(define-constant tier-platinum-threshold u100000000) ;; 100 STX
+
+;; Achievement badge types
+(define-constant badge-first-donor u1)
+(define-constant badge-multi-charity-supporter u2)
+(define-constant badge-streak-master u3)
+(define-constant badge-mega-donor u4)
+(define-constant badge-early-supporter u5)
+(define-constant badge-consistent-giver u6)
+
+;; Donor profile with recognition data
+(define-map donor-profiles
+  { donor: principal }
+  {
+    total-donated: uint,
+    charities-supported: uint,
+    first-donation-block: uint,
+    last-donation-block: uint,
+    current-tier: uint,
+    donation-count: uint,
+    current-streak: uint,
+    longest-streak: uint,
+    impact-score: uint
+  }
+)
+
+;; Donor achievement badges
+(define-map donor-badges
+  { donor: principal, badge-type: uint }
+  {
+    earned-at-block: uint,
+    badge-value: uint
+  }
+)
+
+;; Monthly donation streaks (tracks if donated in current month)
+(define-map donor-monthly-activity
+  { donor: principal, month-year: uint }
+  { donated-this-month: bool }
+)
+
+;; Global donor leaderboard top positions
+(define-map donor-leaderboard
+  { position: uint }
+  {
+    donor: principal,
+    total-donated: uint,
+    last-updated: uint
+  }
+)
+
+;; Counter for active donors in leaderboard
+(define-data-var leaderboard-size uint u0)
+
+;; Read-only functions for donor recognition
+(define-read-only (get-donor-profile (donor principal))
+  (map-get? donor-profiles { donor: donor })
+)
+
+(define-read-only (get-donor-badge (donor principal) (badge-type uint))
+  (map-get? donor-badges { donor: donor, badge-type: badge-type })
+)
+
+(define-read-only (calculate-donor-tier (total-donated uint))
+  (if (>= total-donated tier-platinum-threshold)
+    u4  ;; Platinum
+    (if (>= total-donated tier-gold-threshold)
+      u3  ;; Gold  
+      (if (>= total-donated tier-silver-threshold)
+        u2  ;; Silver
+        (if (>= total-donated tier-bronze-threshold)
+          u1  ;; Bronze
+          u0  ;; No tier
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-donor-leaderboard-position (position uint))
+  (map-get? donor-leaderboard { position: position })
+)
+
+(define-read-only (get-donor-impact-score (donor principal))
+  (let
+    (
+      (profile (map-get? donor-profiles { donor: donor }))
+    )
+    (match profile
+      some-profile (get impact-score some-profile)
+      u0
+    )
+  )
+)
+
+;; Enhanced donation function with donor recognition integration
+(define-public (donate-with-recognition (charity-id uint) (amount uint))
+  (let
+    (
+      (charity (unwrap! (map-get? charities { charity-id: charity-id }) err-not-found))
+      (current-donation (get-donor-contribution charity-id tx-sender))
+      (is-new-donor (is-eq current-donation u0))
+      (current-profile (default-to
+        {
+          total-donated: u0,
+          charities-supported: u0,
+          first-donation-block: stacks-block-height,
+          last-donation-block: stacks-block-height,
+          current-tier: u0,
+          donation-count: u0,
+          current-streak: u0,
+          longest-streak: u0,
+          impact-score: u0
+        }
+        (map-get? donor-profiles { donor: tx-sender })))
+    )
+    (asserts! (get is-active charity) err-charity-not-active)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Update charity donation records
+    (map-set charity-donors
+      { charity-id: charity-id, donor: tx-sender }
+      { amount: (+ current-donation amount) }
+    )
+    
+    (map-set charities
+      { charity-id: charity-id }
+      (merge charity { total-funds: (+ (get total-funds charity) amount) })
+    )
+    
+    ;; Update donor profile with recognition tracking
+    (unwrap-panic (update-donor-profile tx-sender amount (if is-new-donor u1 u0)))
+    
+    ;; Check and award achievement badges
+    (unwrap-panic (check-and-award-badges tx-sender))
+    
+    ;; Update charity analytics
+    (unwrap-panic (update-charity-analytics charity-id is-new-donor amount))
+    
+    (ok true)
+  )
+)
+
+;; Update donor profile and recognition metrics
+(define-private (update-donor-profile (donor principal) (donation-amount uint) (new-charity-supported uint))
+  (let
+    (
+      (current-profile (default-to
+        {
+          total-donated: u0,
+          charities-supported: u0,
+          first-donation-block: stacks-block-height,
+          last-donation-block: stacks-block-height,
+          current-tier: u0,
+          donation-count: u0,
+          current-streak: u0,
+          longest-streak: u0,
+          impact-score: u0
+        }
+        (map-get? donor-profiles { donor: donor })))
+      (new-total-donated (+ (get total-donated current-profile) donation-amount))
+      (new-tier (calculate-donor-tier new-total-donated))
+      (new-donation-count (+ (get donation-count current-profile) u1))
+      (new-charities-supported (+ (get charities-supported current-profile) new-charity-supported))
+      (streak-update (update-donation-streak donor))
+      (new-impact-score (calculate-donor-impact-score 
+        new-total-donated 
+        new-donation-count 
+        new-charities-supported
+        (get current-streak current-profile)))
+    )
+    (map-set donor-profiles
+      { donor: donor }
+      {
+        total-donated: new-total-donated,
+        charities-supported: new-charities-supported,
+        first-donation-block: (get first-donation-block current-profile),
+        last-donation-block: stacks-block-height,
+        current-tier: new-tier,
+        donation-count: new-donation-count,
+        current-streak: (get current-streak current-profile),
+        longest-streak: (get longest-streak current-profile),
+        impact-score: new-impact-score
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Calculate comprehensive donor impact score
+(define-private (calculate-donor-impact-score 
+    (total-donated uint) 
+    (donation-count uint) 
+    (charities-supported uint)
+    (current-streak uint))
+  (let
+    (
+      (donation-score (/ total-donated u1000000))  ;; Points per STX donated
+      (frequency-score (* donation-count u5))      ;; 5 points per donation
+      (diversity-score (* charities-supported u10)) ;; 10 points per charity supported
+      (streak-bonus (* current-streak u15))        ;; 15 points per streak month
+    )
+    (+ donation-score frequency-score diversity-score streak-bonus)
+  )
+)
+
+;; Update monthly donation streak
+(define-private (update-donation-streak (donor principal))
+  (let
+    (
+      (current-month (/ stacks-block-height u144))  ;; Approximate monthly blocks
+      (monthly-key { donor: donor, month-year: current-month })
+      (already-donated-this-month (default-to false 
+        (get donated-this-month 
+          (map-get? donor-monthly-activity monthly-key))))
+      (current-profile (unwrap! (map-get? donor-profiles { donor: donor }) err-not-found))
+    )
+    (if (not already-donated-this-month)
+      (begin
+        (map-set donor-monthly-activity monthly-key { donated-this-month: true })
+        (let
+          (
+            (new-streak (+ (get current-streak current-profile) u1))
+            (new-longest (if (> new-streak (get longest-streak current-profile))
+              new-streak
+              (get longest-streak current-profile)))
+          )
+          (map-set donor-profiles
+            { donor: donor }
+            (merge current-profile 
+              { 
+                current-streak: new-streak,
+                longest-streak: new-longest
+              }
+            )
+          )
+        )
+      )
+      true ;; Already donated this month, no streak update needed
+    )
+    (ok true)
+  )
+)
+
+;; Check and award achievement badges based on donor activity
+(define-private (check-and-award-badges (donor principal))
+  (let
+    (
+      (profile (unwrap! (map-get? donor-profiles { donor: donor }) err-not-found))
+    )
+    ;; Award First Donor badge
+    (if (and (is-eq (get donation-count profile) u1) 
+             (is-none (map-get? donor-badges { donor: donor, badge-type: badge-first-donor })))
+      (map-set donor-badges
+        { donor: donor, badge-type: badge-first-donor }
+        { earned-at-block: stacks-block-height, badge-value: u1 })
+      true)
+    
+    ;; Award Multi-Charity Supporter badge (5+ charities)
+    (if (and (>= (get charities-supported profile) u5) 
+             (is-none (map-get? donor-badges { donor: donor, badge-type: badge-multi-charity-supporter })))
+      (map-set donor-badges
+        { donor: donor, badge-type: badge-multi-charity-supporter }
+        { earned-at-block: stacks-block-height, badge-value: (get charities-supported profile) })
+      true)
+    
+    ;; Award Streak Master badge (6 month streak)
+    (if (and (>= (get current-streak profile) u6) 
+             (is-none (map-get? donor-badges { donor: donor, badge-type: badge-streak-master })))
+      (map-set donor-badges
+        { donor: donor, badge-type: badge-streak-master }
+        { earned-at-block: stacks-block-height, badge-value: (get current-streak profile) })
+      true)
+    
+    ;; Award Mega Donor badge (50+ STX donated)
+    (if (and (>= (get total-donated profile) u50000000) 
+             (is-none (map-get? donor-badges { donor: donor, badge-type: badge-mega-donor })))
+      (map-set donor-badges
+        { donor: donor, badge-type: badge-mega-donor }
+        { earned-at-block: stacks-block-height, badge-value: (/ (get total-donated profile) u1000000) })
+      true)
+    
+    ;; Award Early Supporter badge (donated in first 1000 blocks of contract)
+    (if (and (<= (get first-donation-block profile) u1000) 
+             (is-none (map-get? donor-badges { donor: donor, badge-type: badge-early-supporter })))
+      (map-set donor-badges
+        { donor: donor, badge-type: badge-early-supporter }
+        { earned-at-block: stacks-block-height, badge-value: (get first-donation-block profile) })
+      true)
+    
+    ;; Award Consistent Giver badge (20+ donations)
+    (if (and (>= (get donation-count profile) u20) 
+             (is-none (map-get? donor-badges { donor: donor, badge-type: badge-consistent-giver })))
+      (map-set donor-badges
+        { donor: donor, badge-type: badge-consistent-giver }
+        { earned-at-block: stacks-block-height, badge-value: (get donation-count profile) })
+      true)
+    
+    (ok true)
+  )
+)
+
+;; Update donor leaderboard (top 10 donors by total donation)
+(define-public (update-leaderboard (donor principal))
+  (let
+    (
+      (profile (unwrap! (map-get? donor-profiles { donor: donor }) err-not-found))
+      (total-donated (get total-donated profile))
+      (current-size (var-get leaderboard-size))
+    )
+    ;; Simple leaderboard insertion for top 10
+    (if (< current-size u10)
+      (begin
+        (map-set donor-leaderboard
+          { position: (+ current-size u1) }
+          {
+            donor: donor,
+            total-donated: total-donated,
+            last-updated: stacks-block-height
+          })
+        (var-set leaderboard-size (+ current-size u1))
+        (ok true))
+      ;; Check if current donor qualifies for top 10
+      (let
+        (
+          (lowest-position (var-get leaderboard-size))
+          (lowest-entry (map-get? donor-leaderboard { position: lowest-position }))
+        )
+        (match lowest-entry
+          some-entry
+            (if (> total-donated (get total-donated some-entry))
+              (begin
+                (map-set donor-leaderboard
+                  { position: lowest-position }
+                  {
+                    donor: donor,
+                    total-donated: total-donated,
+                    last-updated: stacks-block-height
+                  })
+                (ok true))
+              (ok false))
+          (ok false))))
+  )
+)
+
 ;; Get total beneficiaries across all verified reports for a charity
 (define-read-only (get-verified-beneficiaries-total (charity-id uint))
   (let
@@ -818,6 +1177,35 @@
         (if (> (get verified-reports some-summary) u0)
           (get total-beneficiaries some-summary)
           u0)
+      u0
+    )
+  )
+)
+
+;; Get donor tier name as string (read-only helper)
+(define-read-only (get-donor-tier-name (tier uint))
+  (if (is-eq tier u4)
+    "Platinum"
+    (if (is-eq tier u3)
+      "Gold"
+      (if (is-eq tier u2)
+        "Silver"
+        (if (is-eq tier u1)
+          "Bronze"
+          "No Tier")))))
+
+;; Check if donor has specific badge
+(define-read-only (has-donor-badge (donor principal) (badge-type uint))
+  (is-some (map-get? donor-badges { donor: donor, badge-type: badge-type })))
+
+;; Get donor's current tier level
+(define-read-only (get-donor-tier-level (donor principal))
+  (let
+    (
+      (profile (map-get? donor-profiles { donor: donor }))
+    )
+    (match profile
+      some-profile (get current-tier some-profile)
       u0
     )
   )
